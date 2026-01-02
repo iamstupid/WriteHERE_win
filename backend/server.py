@@ -11,9 +11,12 @@ import time
 import shutil
 import re
 import signal
+import sys
+import hashlib
 import argparse
 from pathlib import Path
 from datetime import datetime
+import requests
 
 # Parse command-line arguments
 parser = argparse.ArgumentParser(description='Backend server for WriteHERE application')
@@ -34,6 +37,117 @@ socketio = SocketIO(app,
 task_storage = {}
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), 'results')
 os.makedirs(RESULTS_DIR, exist_ok=True)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+ENGINE_MODULE = "recursive.engine"
+
+def _read_text_tail(path: str, max_chars: int = 5000) -> str:
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_chars))
+            return f.read()
+    except Exception:
+        return ""
+
+def _write_task_metadata(task_dir: str, metadata: dict) -> None:
+    try:
+        meta_path = os.path.join(task_dir, 'task.json')
+        with open(meta_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Error writing task metadata: {e}")
+
+MODEL_LIST_CACHE_TTL_SECONDS = 300
+_model_list_cache = {}
+
+def _cache_key(backend: str, api_key: str, query: str, limit: int) -> str:
+    api_key_hash = hashlib.sha256((api_key or "").encode("utf-8")).hexdigest()[:16]
+    return f"{backend}:{api_key_hash}:{query}:{limit}"
+
+def _filter_and_limit_models(models, query: str, limit: int):
+    q = (query or "").strip().lower()
+    if q:
+        models = [m for m in models if q in m.lower()]
+    # Deduplicate while preserving order
+    seen = set()
+    out = []
+    for m in models:
+        if m in seen:
+            continue
+        seen.add(m)
+        out.append(m)
+        if limit and len(out) >= limit:
+            break
+    return out
+
+def _get_models_deepseek(api_key: str):
+    resp = requests.get(
+        "https://api.deepseek.com/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+
+def _get_models_openai(api_key: str):
+    resp = requests.get(
+        "https://api.openai.com/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=20,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+
+def _get_models_openrouter(api_key: str):
+    # Prefer user-scoped model list; fall back to public model list if needed.
+    resp = requests.get(
+        "https://openrouter.ai/api/v1/models/user",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=20,
+    )
+    if resp.status_code >= 400:
+        resp = requests.get(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+            timeout=20,
+        )
+    resp.raise_for_status()
+    data = resp.json()
+    return [m.get("id") for m in data.get("data", []) if isinstance(m, dict) and m.get("id")]
+
+def get_supported_models(backend: str, api_key: str, query: str = "", limit: int = 50):
+    backend = (backend or "").strip().lower()
+    if backend not in ("openai", "openrouter", "deepseek", "anthropic", "gemini"):
+        raise ValueError(f"Unsupported backend: {backend}")
+
+    # Cache (avoid storing raw keys)
+    key = _cache_key(backend, api_key or "", query or "", int(limit or 0))
+    now = time.time()
+    cached = _model_list_cache.get(key)
+    if cached and (now - cached["ts"] < MODEL_LIST_CACHE_TTL_SECONDS):
+        return cached["models"]
+
+    if backend == "deepseek":
+        if not api_key:
+            raise ValueError("Missing apiKey for DeepSeek")
+        models = _get_models_deepseek(api_key)
+    elif backend == "openai":
+        if not api_key:
+            raise ValueError("Missing apiKey for OpenAI")
+        models = _get_models_openai(api_key)
+    elif backend == "openrouter":
+        if not api_key:
+            raise ValueError("Missing apiKey for OpenRouter")
+        models = _get_models_openrouter(api_key)
+    else:
+        raise ValueError(f"Model listing is not supported for backend: {backend}")
+
+    models = _filter_and_limit_models(models, query=query, limit=int(limit or 0) or 50)
+    _model_list_cache[key] = {"ts": now, "models": models}
+    return models
 
 def reload_task_storage():
     """Reload task storage from the file system"""
@@ -58,24 +172,37 @@ def reload_task_storage():
                     "start_time": creation_time
                 }
                 
-                # Try to extract model information from run.sh
-                run_sh_file = os.path.join(task_dir, 'run.sh')
-                if os.path.exists(run_sh_file):
+                # Prefer task metadata written by the backend (cross-platform)
+                task_meta_file = os.path.join(task_dir, 'task.json')
+                if os.path.exists(task_meta_file):
                     try:
-                        with open(run_sh_file, 'r') as f:
-                            run_script = f.read()
-                            # Extract model name from command line arguments
-                            model_match = run_script.split("--model ")[1].split(" ")[0] if "--model " in run_script else None
-                            if model_match:
-                                task_storage[task_id]["model"] = model_match
-                            
-                            # Check if it's a report with search
-                            if "--engine-backend " in run_script:
-                                engine_backend = run_script.split("--engine-backend ")[1].split(" ")[0]
-                                if engine_backend != "none":
-                                    task_storage[task_id]["search_engine"] = engine_backend
+                        with open(task_meta_file, 'r', encoding='utf-8') as f:
+                            meta = json.load(f)
+                        if meta.get("model"):
+                            task_storage[task_id]["model"] = meta["model"]
+                        if meta.get("search_engine"):
+                            task_storage[task_id]["search_engine"] = meta["search_engine"]
                     except Exception as e:
-                        print(f"Error extracting model info from run.sh for {task_id}: {str(e)}")
+                        print(f"Error reading task.json for {task_id}: {str(e)}")
+                else:
+                    # Backward compatibility: Try to extract model information from run.sh
+                    run_sh_file = os.path.join(task_dir, 'run.sh')
+                    if os.path.exists(run_sh_file):
+                        try:
+                            with open(run_sh_file, 'r') as f:
+                                run_script = f.read()
+                                # Extract model name from command line arguments
+                                model_match = run_script.split("--model ")[1].split(" ")[0] if "--model " in run_script else None
+                                if model_match:
+                                    task_storage[task_id]["model"] = model_match
+
+                                # Check if it's a report with search
+                                if "--engine-backend " in run_script:
+                                    engine_backend = run_script.split("--engine-backend ")[1].split(" ")[0]
+                                    if engine_backend != "none":
+                                        task_storage[task_id]["search_engine"] = engine_backend
+                        except Exception as e:
+                            print(f"Error extracting model info from run.sh for {task_id}: {str(e)}")
                 
                 # Load result if available
                 try:
@@ -89,7 +216,7 @@ def reload_task_storage():
 # Load existing tasks on startup
 reload_task_storage()
 
-def run_story_generation(task_id, prompt, model, api_keys):
+def run_story_generation(task_id, prompt, model, api_keys, llm_backend=None, system_prompt=None):
     """
     Run the story generation script as a subprocess
     """
@@ -124,20 +251,26 @@ def run_story_generation(task_id, prompt, model, api_keys):
             f.write(f"CLAUDE={api_keys['claude']}\n")
         if 'gemini' in api_keys and api_keys['gemini']:
             f.write(f"GEMINI={api_keys['gemini']}\n")
+        if 'deepseek' in api_keys and api_keys['deepseek']:
+            f.write(f"DEEPSEEK={api_keys['deepseek']}\n")
         if 'serpapi' in api_keys and api_keys['serpapi']:
             f.write(f"SERPAPI={api_keys['serpapi']}\n")
+        if 'openrouter' in api_keys and api_keys['openrouter']:
+            f.write(f"OPENROUTER={api_keys['openrouter']}\n")
+        if 'openrouterReferer' in api_keys and api_keys['openrouterReferer']:
+            f.write(f"OPENROUTER_REFERER={api_keys['openrouterReferer']}\n")
+        if 'openrouterTitle' in api_keys and api_keys['openrouterTitle']:
+            title = str(api_keys['openrouterTitle']).replace('"', '\\"')
+            f.write(f'OPENROUTER_TITLE="{title}"\n')
+        if llm_backend and str(llm_backend).strip().lower() != "auto":
+            f.write(f"LLM_BACKEND={str(llm_backend).strip().lower()}\n")
     
-    # Create a script to run the engine with the appropriate environment
-    script_path = os.path.join(task_dir, 'run.sh')
-    with open(script_path, 'w') as f:
-        f.write(f"""#!/bin/bash
-        cd {os.path.abspath(os.path.join(os.path.dirname(__file__), '../recursive'))}
-        source {env_file}
-        export TASK_ENV_FILE={env_file}
-        python engine.py --filename {input_file} --output-filename {output_file} --done-flag-file {done_file} --model {model} --mode story --nodes-json-file {nodes_file}
-        """)
-    
-    os.chmod(script_path, 0o755)
+    _write_task_metadata(task_dir, {
+        "mode": "story",
+        "model": model,
+        "llm_backend": str(llm_backend).strip().lower() if llm_backend else None,
+        "created_at": datetime.now().isoformat()
+    })
     
     # Update task status to "running"
     task_storage[task_id] = {
@@ -155,16 +288,52 @@ def run_story_generation(task_id, prompt, model, api_keys):
     monitoring_thread.start()
     
     try:
-        # Run the script
-        process = subprocess.Popen(['/bin/bash', script_path], 
-                                   stdout=subprocess.PIPE, 
-                                   stderr=subprocess.PIPE)
+        # Run the engine directly (cross-platform)
+        env = os.environ.copy()
+        env["TASK_ENV_FILE"] = env_file
+
+        cmd = [
+            sys.executable, "-m", ENGINE_MODULE,
+            "--filename", input_file,
+            "--output-filename", output_file,
+            "--done-flag-file", done_file,
+            "--model", model,
+            "--mode", "story",
+            "--nodes-json-file", nodes_file,
+        ]
+
+        if system_prompt and str(system_prompt).strip():
+            system_prompt_file = os.path.join(task_dir, "system_prompt.txt")
+            with open(system_prompt_file, "w", encoding="utf-8") as f:
+                f.write(str(system_prompt))
+            cmd.extend(["--system-prompt-file", system_prompt_file])
+
+        stdout_log = os.path.join(task_dir, "engine_stdout.log")
+        stderr_log = os.path.join(task_dir, "engine_stderr.log")
+
+        creationflags = 0
+        popen_kwargs = {}
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["preexec_fn"] = os.setsid
+
+        with open(stdout_log, "w", encoding="utf-8", errors="replace") as out, open(stderr_log, "w", encoding="utf-8", errors="replace") as err:
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                env=env,
+                stdout=out,
+                stderr=err,
+                creationflags=creationflags,
+                **popen_kwargs
+            )
         # Store the process object in task_storage for later termination
         task_storage[task_id]["process"] = process
-        stdout, stderr = process.communicate()
+        returncode = process.wait()
         
         # Check if the process completed successfully
-        if process.returncode == 0:
+        if returncode == 0:
             task_storage[task_id]["status"] = "completed"
             # Store the result if available
             if os.path.exists(output_file):
@@ -176,12 +345,12 @@ def run_story_generation(task_id, prompt, model, api_keys):
                 task_storage[task_id]["error"] = "Output file not generated"
         else:
             task_storage[task_id]["status"] = "error"
-            task_storage[task_id]["error"] = stderr.decode('utf-8')
+            task_storage[task_id]["error"] = _read_text_tail(stderr_log)
     except Exception as e:
         task_storage[task_id]["status"] = "error"
         task_storage[task_id]["error"] = str(e)
 
-def run_report_generation(task_id, prompt, model, enable_search, search_engine, api_keys):
+def run_report_generation(task_id, prompt, model, enable_search, search_engine, api_keys, llm_backend=None, system_prompt=None):
     """
     Run the report generation script as a subprocess
     """
@@ -217,22 +386,29 @@ def run_report_generation(task_id, prompt, model, enable_search, search_engine, 
             f.write(f"CLAUDE={api_keys['claude']}\n")
         if 'gemini' in api_keys and api_keys['gemini']:
             f.write(f"GEMINI={api_keys['gemini']}\n")
+        if 'deepseek' in api_keys and api_keys['deepseek']:
+            f.write(f"DEEPSEEK={api_keys['deepseek']}\n")
         if 'serpapi' in api_keys and api_keys['serpapi']:
             f.write(f"SERPAPI={api_keys['serpapi']}\n")
+        if 'openrouter' in api_keys and api_keys['openrouter']:
+            f.write(f"OPENROUTER={api_keys['openrouter']}\n")
+        if 'openrouterReferer' in api_keys and api_keys['openrouterReferer']:
+            f.write(f"OPENROUTER_REFERER={api_keys['openrouterReferer']}\n")
+        if 'openrouterTitle' in api_keys and api_keys['openrouterTitle']:
+            title = str(api_keys['openrouterTitle']).replace('"', '\\"')
+            f.write(f'OPENROUTER_TITLE="{title}"\n')
+        if llm_backend and str(llm_backend).strip().lower() != "auto":
+            f.write(f"LLM_BACKEND={str(llm_backend).strip().lower()}\n")
     
-    # Create a script to run the engine with the appropriate environment
-    script_path = os.path.join(task_dir, 'run.sh')
     engine_backend = search_engine if enable_search else "none"
-    
-    with open(script_path, 'w') as f:
-        f.write(f"""#!/bin/bash
-        cd {os.path.abspath(os.path.join(os.path.dirname(__file__), '../recursive'))}
-        source {env_file}
-        export TASK_ENV_FILE={env_file}
-        python engine.py --filename {input_file} --output-filename {output_file} --done-flag-file {done_file} --model {model} --engine-backend {engine_backend} --mode report --nodes-json-file {nodes_file}
-        """)
-    
-    os.chmod(script_path, 0o755)
+
+    _write_task_metadata(task_dir, {
+        "mode": "report",
+        "model": model,
+        "llm_backend": str(llm_backend).strip().lower() if llm_backend else None,
+        "search_engine": engine_backend if enable_search else None,
+        "created_at": datetime.now().isoformat()
+    })
     
     # Update task status to "running"
     task_storage[task_id] = {
@@ -251,16 +427,53 @@ def run_report_generation(task_id, prompt, model, enable_search, search_engine, 
     monitoring_thread.start()
     
     try:
-        # Run the script
-        process = subprocess.Popen(['/bin/bash', script_path], 
-                                   stdout=subprocess.PIPE, 
-                                   stderr=subprocess.PIPE)
+        # Run the engine directly (cross-platform)
+        env = os.environ.copy()
+        env["TASK_ENV_FILE"] = env_file
+
+        cmd = [
+            sys.executable, "-m", ENGINE_MODULE,
+            "--filename", input_file,
+            "--output-filename", output_file,
+            "--done-flag-file", done_file,
+            "--model", model,
+            "--engine-backend", engine_backend,
+            "--mode", "report",
+            "--nodes-json-file", nodes_file,
+        ]
+
+        if system_prompt and str(system_prompt).strip():
+            system_prompt_file = os.path.join(task_dir, "system_prompt.txt")
+            with open(system_prompt_file, "w", encoding="utf-8") as f:
+                f.write(str(system_prompt))
+            cmd.extend(["--system-prompt-file", system_prompt_file])
+
+        stdout_log = os.path.join(task_dir, "engine_stdout.log")
+        stderr_log = os.path.join(task_dir, "engine_stderr.log")
+
+        creationflags = 0
+        popen_kwargs = {}
+        if os.name == "nt":
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["preexec_fn"] = os.setsid
+
+        with open(stdout_log, "w", encoding="utf-8", errors="replace") as out, open(stderr_log, "w", encoding="utf-8", errors="replace") as err:
+            process = subprocess.Popen(
+                cmd,
+                cwd=str(PROJECT_ROOT),
+                env=env,
+                stdout=out,
+                stderr=err,
+                creationflags=creationflags,
+                **popen_kwargs
+            )
         # Store the process object in task_storage for later termination
         task_storage[task_id]["process"] = process
-        stdout, stderr = process.communicate()
-        
+        returncode = process.wait()
+
         # Check if the process completed successfully
-        if process.returncode == 0:
+        if returncode == 0:
             task_storage[task_id]["status"] = "completed"
             # Store the result if available
             if os.path.exists(output_file):
@@ -272,7 +485,7 @@ def run_report_generation(task_id, prompt, model, enable_search, search_engine, 
                 task_storage[task_id]["error"] = "Output file not generated"
         else:
             task_storage[task_id]["status"] = "error"
-            task_storage[task_id]["error"] = stderr.decode('utf-8')
+            task_storage[task_id]["error"] = _read_text_tail(stderr_log)
     except Exception as e:
         task_storage[task_id]["status"] = "error"
         task_storage[task_id]["error"] = str(e)
@@ -293,7 +506,7 @@ def api_generate_story():
     # Start the generation in a background thread
     thread = threading.Thread(
         target=run_story_generation,
-        args=(task_id, data['prompt'], data['model'], data['apiKeys'])
+        args=(task_id, data['prompt'], data['model'], data['apiKeys'], data.get('llmBackend'), data.get('systemPrompt'))
     )
     thread.start()
     
@@ -322,7 +535,7 @@ def api_generate_report():
     # Start the generation in a background thread
     thread = threading.Thread(
         target=run_report_generation,
-        args=(task_id, data['prompt'], data['model'], enable_search, search_engine, data['apiKeys'])
+        args=(task_id, data['prompt'], data['model'], enable_search, search_engine, data['apiKeys'], data.get('llmBackend'), data.get('systemPrompt'))
     )
     thread.start()
     
@@ -627,7 +840,7 @@ def api_get_task_graph(task_id):
         prompt = "Unknown task"
         if os.path.exists(input_file):
             try:
-                with open(input_file, 'r') as f:
+                with open(input_file, "r", encoding="utf-8") as f:
                     input_data = json.load(f)
                     if 'value' in input_data:
                         prompt = input_data.get('value', '')
@@ -656,7 +869,7 @@ def api_get_task_graph(task_id):
         })
     
     try:
-        with open(nodes_file, 'r') as f:
+        with open(nodes_file, "r", encoding="utf-8") as f:
             nodes_data = json.load(f)
         
         # Transform the data to the format expected by the frontend
@@ -700,7 +913,59 @@ def api_stop_task(task_id):
             })
         
           
-        # Direct approach: Find the pid for the python engine.py process and kill it
+        # Cross-platform termination: stop the stored engine process if present
+        task_dir = os.path.join(RESULTS_DIR, task_id)
+        stop_file = os.path.join(task_dir, 'stop.txt')
+        try:
+            with open(stop_file, 'w') as f:
+                f.write("Stop requested at " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
+
+        process = task_storage.get(task_id, {}).get("process")
+        if process is not None and getattr(process, "pid", None):
+            pid = process.pid
+            print(f"Stopping task {task_id} (PID {pid})")
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            else:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except Exception:
+                    pass
+                for _ in range(10):
+                    if process.poll() is not None:
+                        break
+                    time.sleep(0.2)
+                if process.poll() is None:
+                    try:
+                        os.killpg(os.getpgid(pid), signal.SIGKILL)
+                    except Exception:
+                        pass
+
+        # Create a done file to indicate the task is stopped
+        with open(os.path.join(task_dir, 'done.txt'), 'w') as f:
+            f.write("Stopped by user at " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        # Update task status
+        task_storage[task_id]["status"] = "stopped"
+
+        # Set a result message for stopped tasks
+        task_storage[task_id]["result"] = "Task was stopped by user request before completion."
+
+        # Emit a socket message to notify the frontend
+        socketio.emit('task_update', {
+            'taskId': task_id,
+            'status': 'stopped',
+            'message': 'Task has been stopped by user request'
+        })
+
+        return jsonify({
+            "status": "ok",
+            "message": f"Task {task_id} has been stopped"
+        })
+
+        # Legacy fallback: Find the pid for the python engine.py process and kill it
         task_dir = os.path.join(RESULTS_DIR, task_id)
 
         # 1. Create a stop.txt file for the task to detect gracefully                                                 │ │
@@ -912,6 +1177,39 @@ def api_get_workspace(task_id):
         print(f"Error reading workspace file: {str(e)}")
         return jsonify({"error": f"Failed to read workspace file: {str(e)}"}), 500
 
+@app.route('/api/models', methods=['POST'])
+def api_list_models():
+    """List supported models for a given backend using a provided API key."""
+    data = request.json or {}
+    backend = data.get("backend")
+    api_key = data.get("apiKey") or ""
+    query = data.get("query") or ""
+    limit = data.get("limit", 50)
+
+    try:
+        limit = int(limit)
+    except Exception:
+        limit = 50
+
+    try:
+        models = get_supported_models(backend, api_key, query=query, limit=limit)
+        return jsonify({
+            "backend": (backend or "").strip().lower(),
+            "models": models,
+            "count": len(models),
+        })
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except requests.exceptions.HTTPError as e:
+        status = getattr(e.response, "status_code", 502)
+        try:
+            details = e.response.text
+        except Exception:
+            details = str(e)
+        return jsonify({"error": "Upstream API error", "details": details}), status
+    except Exception as e:
+        return jsonify({"error": f"Failed to list models: {str(e)}"}), 500
+
 @app.route('/api/ping', methods=['GET'])
 def api_ping():
     """Simple endpoint to test if the API is reachable"""
@@ -956,7 +1254,7 @@ def monitor_task_progress(task_id, nodes_dir):
                     print(f"Detected changes to nodes.json, reading file")
                     
                     try:
-                        with open(nodes_file, 'r') as f:
+                        with open(nodes_file, "r", encoding="utf-8") as f:
                             nodes_data = json.load(f)
                         
                         # Transform the data for frontend
@@ -992,7 +1290,7 @@ def monitor_task_progress(task_id, nodes_dir):
         if os.path.exists(nodes_file):
             try:
                 print(f"Reading final state from nodes.json")
-                with open(nodes_file, 'r') as f:
+                with open(nodes_file, "r", encoding="utf-8") as f:
                     nodes_data = json.load(f)
                     
                 transformed_graph = transform_node_to_graph(nodes_data, root=True)

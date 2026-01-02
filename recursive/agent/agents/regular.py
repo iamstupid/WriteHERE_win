@@ -55,6 +55,9 @@ def get_llm_output(node, agent, memory, agent_type, overwrite_cache=False, *args
     system_message = prompt_register.module_dict[prompt_version]().construct_system_message(
         to_run_check_str = to_run_check_str
     )
+    extra_system_prompt = (node.config.get("system_prompt") or "").strip()
+    if extra_system_prompt:
+        system_message = f"{extra_system_prompt}\n\n{system_message}" if system_message else extra_system_prompt
     to_run_task = deepcopy(node.task_info)
     for k in ("candidate_plan", "candidate_think"):
         if k in to_run_task:
@@ -297,6 +300,7 @@ class SimpleExcutor(Agent):
         if task_type == "RETRIEVAL" and inner_kwargs.get("react_agent", False):
             react_agent = SearchAgent(
                 prompt_version = inner_kwargs["prompt_version"],
+                system_prompt = node.config.get("system_prompt"),
                 action_executor = ActionExecutor(
                     actions = [BingBrowser(searcher_type=inner_kwargs["searcher_type"],
                                            language = node.config["language"],
@@ -400,6 +404,9 @@ class SimpleExcutor(Agent):
         prompt_version = inner_kwargs["prompt_version"]
 
         system_message = prompt_register.module_dict[prompt_version]().construct_system_message()
+        extra_system_prompt = (node.config.get("system_prompt") or "").strip()
+        if extra_system_prompt:
+            system_message = f"{extra_system_prompt}\n\n{system_message}" if system_message else extra_system_prompt
         
         to_run_search_task = node.task_info["goal"]
         to_run_search_results = search_results

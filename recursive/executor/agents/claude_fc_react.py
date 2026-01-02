@@ -36,6 +36,7 @@ class SearchAgent(BaseAgent):
     def __init__(self,
                  prompt_version,
                  action_executor: ActionExecutor,
+                 system_prompt=None,
                  llm = OpenAIApiProxy(),
                  protocol = None,
                  model = "gpt-4o",
@@ -45,6 +46,7 @@ class SearchAgent(BaseAgent):
                  has_search_targets = False,
                  parse_arg_dict = {}) -> None:
         self.message_constructor = prompt_register.module_dict[prompt_version]()
+        self.system_prompt = system_prompt
         self.max_turn = max_turn
         self.model = model
         self.force_step = '你需要基于历史消息返回一个最终结果'
@@ -124,6 +126,9 @@ class SearchAgent(BaseAgent):
         # makeup tool executoation
         formatted = []
         system_message = self.message_constructor.construct_system_message()
+        extra_system_prompt = (self.system_prompt or "").strip()
+        if extra_system_prompt:
+            system_message = f"{extra_system_prompt}\n\n{system_message}" if system_message else extra_system_prompt
         if system_message.strip() != "":
             formatted.append(dict(role='system', content=system_message))
         formatted += chat_history

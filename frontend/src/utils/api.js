@@ -237,3 +237,28 @@ export const stopTask = async (taskId) => {
     throw error;
   }
 };
+
+/**
+ * Lists available models for a given backend (OpenAI/OpenRouter/DeepSeek, etc.)
+ * @param {Object} params
+ * @param {string} params.backend - Backend name (e.g. 'openai', 'openrouter', 'deepseek')
+ * @param {string} params.apiKey - API key for the backend
+ * @param {string} [params.query] - Optional search query to filter models
+ * @param {number} [params.limit] - Max models to return
+ * @returns {Promise} - Promise that resolves with model list
+ */
+export const listModels = async (params) => {
+  try {
+    const response = await apiClient.post('/models', params);
+    return response.data;
+  } catch (error) {
+    console.error('Error listing models:', error);
+    if (error.response) {
+      throw new Error(`Server error: ${error.response.data.error || error.response.statusText}`);
+    } else if (error.request) {
+      throw new Error('No response from server. Please make sure the backend is running.');
+    } else {
+      throw error;
+    }
+  }
+};

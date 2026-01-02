@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 from overrides import overrides
 import random
 import json
+import os
 from recursive.utils.register import Register
 from recursive.executor.actions.register import executor_register, tool_register
 from recursive.executor.actions import ActionExecutor
@@ -45,7 +46,7 @@ class Agent(ABC):
         message.append({"role": "user", "content": prompt})
         logger.info(message[-1]["content"])
         
-        model = other_inner_args.pop("model", "gpt-4o")
+        model = other_inner_args.pop("model", os.getenv("DEFAULT_MODEL") or os.getenv("MODEL") or "gpt-4o")
         
         resp = llm.call(messages = message,
                         model=model,

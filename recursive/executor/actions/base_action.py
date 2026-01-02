@@ -145,7 +145,11 @@ def tool_api(func: Optional[Callable] = None,
             if doc.kind is DocstringSectionKind.parameters:
                 for d in doc.value:
                     d = d.as_dict()
-                    d['type'] = _detect_type(d["annotation"].lower())
+                    annotation = d.get("annotation")
+                    if annotation is None:
+                        d['type'] = 'STRING'
+                    else:
+                        d['type'] = _detect_type(str(annotation).lower())
                     args_doc[d['name']] = d
             if doc.kind is DocstringSectionKind.returns:
                 for d in doc.value:
@@ -156,18 +160,30 @@ def tool_api(func: Optional[Callable] = None,
                     if not d['annotation']:
                         d.pop('annotation')
                     else:
-                        d['type'] = _detect_type(d['annotation'].lower())
+                        d['type'] = _detect_type(str(d['annotation']).lower())
                     returns_doc.append(d)
 
         sig = inspect.signature(function)
         for name, param in sig.parameters.items():
             if name == 'self':
                 continue
+
+            doc_arg = args_doc.get(param.name, {})
+            annotation = doc_arg.get("annotation")
+            if annotation is None or annotation == "":
+                if param.annotation is inspect.Signature.empty:
+                    annotation = ""
+                else:
+                    annotation = getattr(param.annotation, "__name__", str(param.annotation))
+
+            arg_type = doc_arg.get("type")
+            if not arg_type:
+                arg_type = _detect_type(str(annotation).lower()) if annotation else 'STRING'
             parameter = dict(
                 name=param.name,
-                type=args_doc[param.name]["type"],
-                annotation=args_doc[param.name].get("annotation", ""),
-                description=args_doc[param.name]["description"])
+                type=arg_type,
+                annotation=annotation or "",
+                description=doc_arg.get("description", ""))
             desc['parameters'].append(parameter)
             if param.default is inspect.Signature.empty:
                 parameter["required"] = True
@@ -175,7 +191,8 @@ def tool_api(func: Optional[Callable] = None,
 
         return_data = []
         if explode_return:
-            return_data = _explode(returns_doc[0]['description'])
+            if returns_doc:
+                return_data = _explode(returns_doc[0].get('description', ''))
         elif returns_named_value:
             return_data = returns_doc
         if return_data:

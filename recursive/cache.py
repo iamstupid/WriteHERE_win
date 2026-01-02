@@ -1,13 +1,20 @@
 import hashlib
 import string
 import json
-import fcntl
 from loguru import logger
 import threading
 import os
 import datetime
 import copy
 from copy import deepcopy
+
+try:
+    import fcntl  # type: ignore
+except Exception:
+    fcntl = None
+
+if os.name == "nt":
+    import msvcrt
 
 def string_to_md5(string):
     md5 = hashlib.md5()
@@ -41,13 +48,13 @@ def obj_to_hash(obj):
     return ret
 
 def get_data_list_from_jsonl(fn):
-    with open(fn) as f:
+    with open(fn, encoding="utf-8") as f:
         data_list = [json.loads(line) for line in f]
     
     return data_list
 
 def append_jsonl(fn, data):
-    with open(fn, 'a') as f:
+    with open(fn, "a", encoding="utf-8") as f:
         f.write(json.dumps(data, ensure_ascii=False) + '\n')
         
 def get_datatime(mode=0):
@@ -66,13 +73,30 @@ class FileLock:
         self.file = None
 
     def __enter__(self):
-        self.file = open(self.file_path, 'a')
-        fcntl.flock(self.file, fcntl.LOCK_EX)
+        self.file = open(self.file_path, "a+", encoding="utf-8")
+        if os.name == "nt":
+            # msvcrt locks from the current file position; lock 1 byte at the start.
+            self.file.seek(0)
+            msvcrt.locking(self.file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            if fcntl is None:
+                raise RuntimeError("fcntl is required for file locking on non-Windows platforms")
+            fcntl.flock(self.file, fcntl.LOCK_EX)
         return self.file
 
     def __exit__(self, exc_type, exc_value, traceback):
-        fcntl.flock(self.file, fcntl.LOCK_UN)
-        self.file.close()
+        try:
+            if os.name == "nt":
+                try:
+                    self.file.seek(0)
+                    msvcrt.locking(self.file.fileno(), msvcrt.LK_UNLCK, 1)
+                except Exception:
+                    pass
+            else:
+                if fcntl is not None:
+                    fcntl.flock(self.file, fcntl.LOCK_UN)
+        finally:
+            self.file.close()
   
 def get_omit_json(data, max_str_len=100, max_list_len=10, to_str=True):
     data = copy.deepcopy(data)

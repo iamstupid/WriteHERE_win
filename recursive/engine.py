@@ -56,7 +56,7 @@ class GraphRunEngine:
         with open(root_node_file, "wb") as f:
             pickle.dump(self.root_node, f)
         
-        with open(root_node_json_file, "w") as f:
+        with open(root_node_json_file, "w", encoding="utf-8") as f:
             json.dump(self.root_node.to_json(), f, indent=4, ensure_ascii=False)
             
         self.memory.save(folder)
@@ -101,7 +101,7 @@ class GraphRunEngine:
             
             # Save final nodes.json if path provided
             if nodes_json_file:
-                with open(nodes_json_file, "w") as f:
+                with open(nodes_json_file, "w", encoding="utf-8") as f:
                     json.dump(self.root_node.to_json(), f, indent=4, ensure_ascii=False)
                 
             return "done"
@@ -112,7 +112,7 @@ class GraphRunEngine:
         
         # Update nodes.json after each step if path provided 
         if nodes_json_file:
-            with open(nodes_json_file, "w") as f:
+            with open(nodes_json_file, "w", encoding="utf-8") as f:
                 json.dump(self.root_node.to_json(), f, indent=4, ensure_ascii=False)
                 
         if not full_step:
@@ -167,7 +167,7 @@ class GraphRunEngine:
 
 
 def read_jsonl(filename: str, jsonl_format=True) -> List[Dict]:
-    with open(filename, 'r') as f:
+    with open(filename, "r", encoding="utf-8") as f:
         if filename.endswith(".jsonl") or jsonl_format:
             data = []
             for line in f.readlines():
@@ -188,10 +188,12 @@ def story_writing(input_filename,
                   end,
                   done_flag_file,
                   global_use_model,
-                  nodes_json_file=None):
+                  nodes_json_file=None,
+                  system_prompt=None):
     
     config = {
-        "language": "en", 
+        "language": "en",
+        "system_prompt": system_prompt or "",
         "action_mapping": {
             "plan": ["UpdateAtomPlanningAgent", {}],
             "update": ["DummyRandomUpdateAgent", {}],
@@ -359,16 +361,18 @@ def report_writing(input_filename,
                    global_use_model,
                    engine_backend,
                    nodes_json_file=None,
-                   today_date=None):
+                   today_date=None,
+                   system_prompt=None):
     # Use current date if not provided
     if today_date is None:
         today_date = datetime.now().strftime("%b %d, %Y")
     config = {
-        "language": "en", 
+        "language": "en",
         # Agent is Defined in recursive.agent.agents.regular
         # update, prior_reflect, planning_post_reflect and execute_post_reflect is skipped, by using Dummy Agent
         # prompt is Defined in recursive.agent.prompts
         "today_date": today_date,  # Add the today_date parameter to config
+        "system_prompt": system_prompt or "",
         "action_mapping": {
             "plan": ["UpdateAtomPlanningAgent", {}],
             "update": ["DummyRandomUpdateAgent", {}],
@@ -557,7 +561,7 @@ def report_writing(input_filename,
         qstr = item["id"]
         folder = "{}/{}".format(root_folder, qstr)
         os.makedirs(folder, exist_ok=True)
-        rf = open("{}/report.md".format(folder), "w")
+        rf = open("{}/report.md".format(folder), "w", encoding="utf-8")
         
         custom_format = "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>"
         log_id = logger.add("{}/engine.log".format(folder), format=custom_format)
@@ -593,6 +597,8 @@ def define_args():
     parser.add_argument("--length", type=int)
     parser.add_argument("--engine-backend", type=str)
     parser.add_argument("--nodes-json-file", type=str, help="Path to save nodes.json for real-time visualization")
+    parser.add_argument("--system-prompt", type=str, default=None, help="Extra system prompt prepended to all system messages")
+    parser.add_argument("--system-prompt-file", type=str, default=None, help="Path to a UTF-8 text file containing the system prompt")
     current_date = datetime.now().strftime("%b %d, %Y")  # Format: "Apr 1, 2025"
     parser.add_argument("--today-date", type=str, default=current_date, help="Today's date to use in prompts (default: current date)")
     
@@ -607,11 +613,20 @@ def define_args():
 if __name__ == "__main__":
     parser = define_args()
     args = parser.parse_args()
+
+    # Ensure all LLM calls default to the CLI-selected model unless explicitly overridden.
+    import os
+    os.environ["DEFAULT_MODEL"] = args.model
+
+    system_prompt = args.system_prompt
+    if args.system_prompt_file:
+        with open(args.system_prompt_file, "r", encoding="utf-8") as f:
+            system_prompt = f.read()
     if args.mode == "story":
         story_writing(args.filename, args.output_filename,
                       args.start, args.end, args.done_flag_file, args.model,
-                      nodes_json_file=args.nodes_json_file)
+                      nodes_json_file=args.nodes_json_file, system_prompt=system_prompt)
     else:
         report_writing(args.filename, args.output_filename,
                        args.start, args.end, args.done_flag_file, args.model, args.engine_backend,
-                       nodes_json_file=args.nodes_json_file, today_date=args.today_date)
+                       nodes_json_file=args.nodes_json_file, today_date=args.today_date, system_prompt=system_prompt)

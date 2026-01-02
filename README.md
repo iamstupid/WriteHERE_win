@@ -112,6 +112,13 @@ You can customize the ports using command-line arguments:
 ./start.sh --backend-port 8080 --frontend-port 8000
 ```
 
+#### Windows (PowerShell)
+
+On Windows, use the PowerShell launcher:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\\start.ps1 -BackendPort 5001 -FrontendPort 3000
+```
+
 #### For Anaconda/Miniconda Users
 
 If you're using Anaconda and encounter dependency conflicts, use:

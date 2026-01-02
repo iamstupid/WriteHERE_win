@@ -31,7 +31,8 @@ import ExpandMoreIcon from '@mui/icons-material/ExpandMore';
 import Visibility from '@mui/icons-material/Visibility';
 import VisibilityOff from '@mui/icons-material/VisibilityOff';
 import InfoIcon from '@mui/icons-material/Info';
-import { generateStory, pingAPI } from '../utils/api';
+import SearchIcon from '@mui/icons-material/Search';
+import { generateStory, pingAPI, listModels } from '../utils/api';
 import HistoryPanel from '../components/HistoryPanel';
 
 // Recommended model options
@@ -40,6 +41,8 @@ const commonModels = [
   { label: 'Claude 3.5 Sonnet', value: 'claude-3-5-sonnet-20241022' },
   { label: 'GPT-4o', value: 'gpt-4o' },
   { label: 'GPT-4o-mini', value: 'gpt-4o-mini' },
+  { label: 'DeepSeek Chat', value: 'deepseek-chat' },
+  { label: 'DeepSeek Reasoner', value: 'deepseek-reasoner' },
   { label: 'Gemini 2.5 Pro Exp', value: 'gemini-2.5-pro-exp-03-25' },
   { label: 'Gemini 2.5 Pro Preview', value: 'gemini-2.5-pro-preview-03-25' },
 ];
@@ -54,16 +57,27 @@ const examplePrompts = [
 const StoryGenerationPage = () => {
   const [prompt, setPrompt] = useState('');
   const [model, setModel] = useState('claude-3-7-sonnet-20250219');
+  const [llmBackend, setLlmBackend] = useState(localStorage.getItem('llm_backend') || 'auto');
+  const [systemPrompt, setSystemPrompt] = useState(localStorage.getItem('system_prompt') || '');
   const [apiKeys, setApiKeys] = useState({
     openai: localStorage.getItem('openai_api_key') || '',
     claude: localStorage.getItem('claude_api_key') || '',
     gemini: localStorage.getItem('gemini_api_key') || '',
+    deepseek: localStorage.getItem('deepseek_api_key') || '',
+    openrouter: localStorage.getItem('openrouter_api_key') || '',
+    openrouterReferer: localStorage.getItem('openrouter_referer') || '',
+    openrouterTitle: localStorage.getItem('openrouter_title') || '',
   });
   const [showApiSection, setShowApiSection] = useState(false);
   const [showOpenAIKey, setShowOpenAIKey] = useState(false);
   const [showClaudeKey, setShowClaudeKey] = useState(false);
   const [showGeminiKey, setShowGeminiKey] = useState(false);
+  const [showDeepSeekKey, setShowDeepSeekKey] = useState(false);
+  const [showOpenRouterKey, setShowOpenRouterKey] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState('');
+  const [remoteModels, setRemoteModels] = useState([]);
   const [error, setError] = useState('');
   const [statusMessage, setStatusMessage] = useState('');
   const [showStatus, setShowStatus] = useState(false);
@@ -74,7 +88,94 @@ const StoryGenerationPage = () => {
     if (apiKeys.openai) localStorage.setItem('openai_api_key', apiKeys.openai);
     if (apiKeys.claude) localStorage.setItem('claude_api_key', apiKeys.claude);
     if (apiKeys.gemini) localStorage.setItem('gemini_api_key', apiKeys.gemini);
+    if (apiKeys.deepseek) localStorage.setItem('deepseek_api_key', apiKeys.deepseek);
+    if (apiKeys.openrouter) localStorage.setItem('openrouter_api_key', apiKeys.openrouter);
+    if (apiKeys.openrouterReferer) localStorage.setItem('openrouter_referer', apiKeys.openrouterReferer);
+    if (apiKeys.openrouterTitle) localStorage.setItem('openrouter_title', apiKeys.openrouterTitle);
   }, [apiKeys]);
+
+  useEffect(() => {
+    localStorage.setItem('llm_backend', llmBackend);
+  }, [llmBackend]);
+
+  useEffect(() => {
+    localStorage.setItem('system_prompt', systemPrompt);
+  }, [systemPrompt]);
+
+  const resolveBackendForModels = () => {
+    const backend = (llmBackend || 'auto').toLowerCase();
+    if (backend !== 'auto') return backend;
+
+    const candidates = [];
+    if (apiKeys.deepseek) candidates.push('deepseek');
+    if (apiKeys.openrouter) candidates.push('openrouter');
+    if (apiKeys.openai) candidates.push('openai');
+    if (apiKeys.claude) candidates.push('anthropic');
+    if (apiKeys.gemini) candidates.push('gemini');
+    if (candidates.length === 1) return candidates[0];
+    return null;
+  };
+
+  const getApiKeyForBackend = (backend) => {
+    switch ((backend || '').toLowerCase()) {
+      case 'deepseek':
+        return apiKeys.deepseek;
+      case 'openrouter':
+        return apiKeys.openrouter;
+      case 'openai':
+        return apiKeys.openai;
+      case 'anthropic':
+        return apiKeys.claude;
+      case 'gemini':
+        return apiKeys.gemini;
+      default:
+        return '';
+    }
+  };
+
+  const handleSearchModels = async () => {
+    setModelsError('');
+    const backend = resolveBackendForModels();
+    if (!backend) {
+      setModelsError('Select an LLM Backend (or provide exactly one API key) to search models.');
+      setShowApiSection(true);
+      return;
+    }
+
+    const apiKey = getApiKeyForBackend(backend);
+    if (!apiKey) {
+      setModelsError(`Missing API key for ${backend}.`);
+      setShowApiSection(true);
+      return;
+    }
+
+    setModelsLoading(true);
+    try {
+      const resp = await listModels({
+        backend,
+        apiKey,
+        query: model || '',
+        limit: 50
+      });
+      setRemoteModels(resp.models || []);
+      setShowStatus(true);
+      setStatusMessage(`Found ${resp.count || (resp.models || []).length} models for ${backend}.`);
+    } catch (err) {
+      setModelsError(err.message || 'Failed to list models');
+    } finally {
+      setModelsLoading(false);
+    }
+  };
+
+  const modelOptions = React.useMemo(() => {
+    const byId = new Map();
+    for (const m of commonModels) byId.set(m.value, m);
+    for (const id of remoteModels || []) {
+      if (!id) continue;
+      if (!byId.has(id)) byId.set(id, { label: id, value: id });
+    }
+    return Array.from(byId.values());
+  }, [remoteModels]);
 
   // Check if API is available on component mount
   useEffect(() => {
@@ -99,24 +200,44 @@ const StoryGenerationPage = () => {
     }
     
     // Check if the appropriate API key is provided
-    const isOpenAIModel = model.toLowerCase().includes('gpt');
-    const isClaudeModel = model.toLowerCase().includes('claude');
-    const isGeminiModel = model.toLowerCase().includes('gemini');
+    const modelLower = (model || '').toLowerCase();
+    const backend = (llmBackend || 'auto').toLowerCase();
+    let effectiveBackend = backend;
     
-    if (isOpenAIModel && !apiKeys.openai) {
+    if (backend === 'auto') {
+      if (modelLower.startsWith('openrouter:') || modelLower.includes('/')) effectiveBackend = 'openrouter';
+      else if (modelLower.includes('claude')) effectiveBackend = 'anthropic';
+      else if (modelLower.includes('gemini')) effectiveBackend = 'gemini';
+      else if (modelLower.includes('deepseek')) effectiveBackend = 'deepseek';
+      else effectiveBackend = 'openai';
+    }
+    
+    if (effectiveBackend === 'openrouter' && !apiKeys.openrouter) {
+      setError('Please provide your OpenRouter API key in the settings section.');
+      setShowApiSection(true);
+      return;
+    }
+    
+    if (effectiveBackend === 'openai' && !apiKeys.openai) {
       setError('Please provide your OpenAI API key in the settings section.');
       setShowApiSection(true);
       return;
     }
     
-    if (isClaudeModel && !apiKeys.claude) {
-      setError('Please provide your Anthropic Claude API key in the settings section.');
+    if (effectiveBackend === 'anthropic' && !apiKeys.claude) {
+      setError('Please provide your Anthropic API key in the settings section.');
       setShowApiSection(true);
       return;
     }
     
-    if (isGeminiModel && !apiKeys.gemini) {
+    if (effectiveBackend === 'gemini' && !apiKeys.gemini) {
       setError('Please provide your Google Gemini API key in the settings section.');
+      setShowApiSection(true);
+      return;
+    }
+
+    if (effectiveBackend === 'deepseek' && !apiKeys.deepseek) {
+      setError('Please provide your DeepSeek API key in the settings section.');
       setShowApiSection(true);
       return;
     }
@@ -139,10 +260,16 @@ const StoryGenerationPage = () => {
       const response = await generateStory({
         prompt,
         model,
+        llmBackend,
+        systemPrompt,
         apiKeys: {
           openai: apiKeys.openai,
           claude: apiKeys.claude,
-          gemini: apiKeys.gemini
+          gemini: apiKeys.gemini,
+          deepseek: apiKeys.deepseek,
+          openrouter: apiKeys.openrouter,
+          openrouterReferer: apiKeys.openrouterReferer,
+          openrouterTitle: apiKeys.openrouterTitle,
         }
       });
       
@@ -228,7 +355,7 @@ const StoryGenerationPage = () => {
             <Grid item xs={12} md={6}>
               <Autocomplete
                 freeSolo
-                options={commonModels}
+                options={modelOptions}
                 getOptionLabel={(option) => {
                   if (typeof option === 'string') {
                     return option;
@@ -257,7 +384,27 @@ const StoryGenerationPage = () => {
                     variant="outlined"
                     fullWidth
                     placeholder="Enter or select a model"
-                    helperText="Enter any model name or select from suggestions"
+                    helperText={modelsError ? `Model search error: ${modelsError}` : (modelsLoading ? 'Searching models...' : 'Enter any model name. For OpenRouter, use provider/model (e.g. openai/gpt-4o).')}
+                    InputProps={{
+                      ...params.InputProps,
+                      endAdornment: (
+                        <>
+                          <Tooltip title="Search available models for your selected backend">
+                            <span>
+                              <IconButton
+                                size="small"
+                                onClick={handleSearchModels}
+                                disabled={modelsLoading}
+                                edge="end"
+                              >
+                                <SearchIcon fontSize="small" />
+                              </IconButton>
+                            </span>
+                          </Tooltip>
+                          {params.InputProps.endAdornment}
+                        </>
+                      ),
+                    }}
                   />
                 )}
                 renderOption={(props, option) => (
@@ -319,7 +466,7 @@ const StoryGenerationPage = () => {
                 >
                   <Typography variant="subtitle1" sx={{ fontWeight: 600, display: 'flex', alignItems: 'center' }}>
                     API Settings
-                    <Tooltip title="Your API keys are stored locally in your browser and are never sent to our servers">
+                    <Tooltip title="Your API keys are stored locally in your browser and sent only to your backend server for this app">
                       <IconButton size="small" sx={{ ml: 1 }}>
                         <InfoIcon fontSize="small" color="action" />
                       </IconButton>
@@ -328,6 +475,37 @@ const StoryGenerationPage = () => {
                 </AccordionSummary>
                 <AccordionDetails>
                   <Grid container spacing={3}>
+                    <Grid item xs={12} md={4}>
+                      <FormControl fullWidth>
+                        <InputLabel id="llm-backend-label">LLM Backend</InputLabel>
+                        <Select
+                          labelId="llm-backend-label"
+                          value={llmBackend}
+                          label="LLM Backend"
+                          onChange={(e) => setLlmBackend(e.target.value)}
+                        >
+                          <MenuItem value="auto">Auto</MenuItem>
+                          <MenuItem value="openai">OpenAI</MenuItem>
+                          <MenuItem value="anthropic">Anthropic</MenuItem>
+                          <MenuItem value="gemini">Gemini</MenuItem>
+                          <MenuItem value="openrouter">OpenRouter</MenuItem>
+                          <MenuItem value="deepseek">DeepSeek</MenuItem>
+                        </Select>
+                      </FormControl>
+                    </Grid>
+                    <Grid item xs={12}>
+                      <TextField
+                        label="System Prompt (optional)"
+                        fullWidth
+                        variant="outlined"
+                        value={systemPrompt}
+                        onChange={(e) => setSystemPrompt(e.target.value)}
+                        multiline
+                        minRows={3}
+                        placeholder="Add global instructions for the model..."
+                        helperText="Prepended to every system message in this run"
+                      />
+                    </Grid>
                     <Grid item xs={12} md={4}>
                       <TextField
                         label="OpenAI API Key"
@@ -403,10 +581,81 @@ const StoryGenerationPage = () => {
                         }}
                       />
                     </Grid>
+                    <Grid item xs={12} md={4}>
+                      <TextField
+                        label="DeepSeek API Key"
+                        fullWidth
+                        variant="outlined"
+                        value={apiKeys.deepseek}
+                        onChange={(e) => handleApiKeyChange('deepseek', e.target.value)}
+                        type={showDeepSeekKey ? 'text' : 'password'}
+                        placeholder="sk-..."
+                        helperText="Required for DeepSeek models (e.g. deepseek-chat)"
+                        InputProps={{
+                          endAdornment: (
+                            <InputAdornment position="end">
+                              <IconButton
+                                aria-label="toggle password visibility"
+                                onClick={() => setShowDeepSeekKey(!showDeepSeekKey)}
+                                edge="end"
+                              >
+                                {showDeepSeekKey ? <VisibilityOff /> : <Visibility />}
+                              </IconButton>
+                            </InputAdornment>
+                          ),
+                        }}
+                      />
+                    </Grid>
+                    <Grid item xs={12} md={4}>
+                      <TextField
+                        label="OpenRouter API Key"
+                        fullWidth
+                        variant="outlined"
+                        value={apiKeys.openrouter}
+                        onChange={(e) => handleApiKeyChange('openrouter', e.target.value)}
+                        type={showOpenRouterKey ? 'text' : 'password'}
+                        placeholder="sk-or-..."
+                        helperText="Required for OpenRouter models (e.g. openai/gpt-4o, anthropic/claude-3.5-sonnet)"
+                        InputProps={{
+                          endAdornment: (
+                            <InputAdornment position="end">
+                              <IconButton
+                                aria-label="toggle password visibility"
+                                onClick={() => setShowOpenRouterKey(!showOpenRouterKey)}
+                                edge="end"
+                              >
+                                {showOpenRouterKey ? <VisibilityOff /> : <Visibility />}
+                              </IconButton>
+                            </InputAdornment>
+                          ),
+                        }}
+                      />
+                    </Grid>
+                    <Grid item xs={12} md={6}>
+                      <TextField
+                        label="OpenRouter HTTP-Referer (optional)"
+                        fullWidth
+                        variant="outlined"
+                        value={apiKeys.openrouterReferer}
+                        onChange={(e) => handleApiKeyChange('openrouterReferer', e.target.value)}
+                        placeholder="https://your.site"
+                        helperText="Optional header for OpenRouter rankings"
+                      />
+                    </Grid>
+                    <Grid item xs={12} md={6}>
+                      <TextField
+                        label="OpenRouter X-Title (optional)"
+                        fullWidth
+                        variant="outlined"
+                        value={apiKeys.openrouterTitle}
+                        onChange={(e) => handleApiKeyChange('openrouterTitle', e.target.value)}
+                        placeholder="WriteHERE"
+                        helperText="Optional header for OpenRouter rankings"
+                      />
+                    </Grid>
                     <Grid item xs={12}>
                       <Typography variant="caption" color="text.secondary">
-                        Your API keys are stored securely in your browser's local storage and are never sent to our servers.
-                        They are only used to make direct API calls to the respective services from your browser.
+                        Your API keys are stored in your browser's local storage and are sent to the backend server of this app to run the generation.
                       </Typography>
                     </Grid>
                   </Grid>

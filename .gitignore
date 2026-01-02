@@ -9,6 +9,11 @@ llm.py.bak
 *.DS_Store
 *.egg-info/
 backend/results/
+server_pids.json
+backend/server_stdout.log
+backend/server_stderr.log
+frontend/server_stdout.log
+frontend/server_stderr.log
 
 # Node.js
 node_modules/

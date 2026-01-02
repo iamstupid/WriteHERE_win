@@ -14,13 +14,12 @@ from recursive.memory import caches
 from dotenv import load_dotenv
 import google.generativeai as genai
 from openai import OpenAI
+from pathlib import Path
 
-# Load environment variables from api_key.env if it exists
-load_dotenv(dotenv_path='api_key.env')
+# Load environment variables from recursive/api_key.env if it exists (independent of cwd)
+load_dotenv(dotenv_path=str(Path(__file__).resolve().parent.parent / 'api_key.env'))
 
 # Also check for temporary environment files passed from the frontend
-import os
-current_dir = os.path.dirname(os.path.abspath(__file__))
 task_env_file = os.environ.get('TASK_ENV_FILE')
 if task_env_file and os.path.exists(task_env_file):
     load_dotenv(dotenv_path=task_env_file, override=True)
@@ -126,24 +125,56 @@ class OpenAIApiProxy():
         return data
 
 
-    def call(self, model, messages, no_cache = False, overwrite_cache=False, tools=None, temperature=None, headers={}, use_official=None, **kwargs):
+    def call(self, model, messages, no_cache = False, overwrite_cache=False, tools=None, temperature=None, headers=None, use_official=None, **kwargs):
         assert tools is None
+        headers = {} if headers is None else dict(headers)
         messages = copy.deepcopy(messages)
-        
-        # Check if model name includes openrouter model identifier
-        if any(provider in model for provider in ["google/", "anthropic/", "meta/", "mistral/"]):
+
+        model = str(model)
+        model_lower = model.lower()
+
+        # Normalize backend selection
+        if isinstance(use_official, str):
+            use_official = use_official.strip().lower()
+            if use_official in ("", "auto", "none"):
+                use_official = None
+
+        if use_official is None:
+            env_backend = os.getenv("LLM_BACKEND") or os.getenv("USE_OFFICIAL")
+            if env_backend:
+                env_backend = env_backend.strip().lower()
+                if env_backend not in ("", "auto", "none"):
+                    use_official = env_backend
+
+        # Support explicit model prefix "openrouter:"
+        if model_lower.startswith("openrouter:"):
+            model = model.split(":", 1)[1].strip()
+            model_lower = model.lower()
+            if use_official is None:
+                use_official = "openrouter"
+
+        # Auto route OpenRouter models with provider prefix, e.g. "anthropic/claude-3.5-sonnet"
+        if use_official is None and "/" in model:
             use_official = "openrouter"
 
-        is_gpt = True if "gpt" in model or "o1" in model else False
-    
+        # If still unset, route based on model name
+        if use_official is None:
+            if "claude" in model_lower:
+                use_official = "anthropic"
+            elif "gemini" in model_lower:
+                use_official = "gemini"
+            elif "deepseek" in model_lower:
+                use_official = "deepseek"
+            else:
+                use_official = "openai"
+
+        is_gpt = True if "gpt" in model_lower or "o1" in model_lower else False
+     
         params_gpt = {
             "model": model,
             "messages": messages,
             "max_tokens": 8192,
         }
-        
-        if "claude" in model:
-            use_official = "anthropic"
         
         if self.verbose:
             logger.info("Messages: {}".format(json.dumps(messages, ensure_ascii=False, indent=4)))
@@ -151,33 +182,39 @@ class OpenAIApiProxy():
         if temperature is not None:
             params_gpt["temperature"] = temperature
 
-        if 'o1' in model:
-            url = ''
-            api_key = ""
-            params_gpt["max_tokens"] = 32768
-        elif "gpt" in model:
-            url = "https://api.openai.com/v1/chat/completions"
-            api_key = str(os.getenv('OPENAI'))
-        elif "claude" in model:
-            url = 'https://api.anthropic.com/v1/messages'
-            api_key = str(os.getenv('CLAUDE'))
-        elif "deepseek" in model:
-            url = ''
-            api_key = ''
-        elif use_official == "openrouter" or "openrouter" in model:
-            # Use OpenRouter API
+        if use_official == "openrouter":
+            # Use OpenRouter API (OpenAI-compatible)
             url = "https://openrouter.ai/api/v1/chat/completions"
             api_key = str(os.getenv('OPENROUTER'))
             # Add HTTP-Referer and X-Title headers for OpenRouter
             headers['HTTP-Referer'] = os.getenv('OPENROUTER_REFERER', '')
             headers['X-Title'] = os.getenv('OPENROUTER_TITLE', '')
-        elif "gemini" in model:
+        elif use_official == "deepseek":
+            # DeepSeek API is OpenAI-compatible
+            url = "https://api.deepseek.com/v1/chat/completions"
+            api_key = str(os.getenv('DEEPSEEK') or os.getenv('DEEPSEEK_API_KEY') or "")
+        elif use_official == "anthropic":
+            url = 'https://api.anthropic.com/v1/messages'
+            api_key = str(os.getenv('CLAUDE'))
+        elif use_official == "gemini":
             # For Gemini, we'll use the Google API directly, not REST API
             api_key = str(os.getenv('GEMINI'))
             genai.configure(api_key=api_key)
             url = None  # Not used for Gemini
+        else:
+            # OpenAI-compatible (default)
+            if 'o1' in model_lower:
+                url = ''
+                api_key = ""
+                params_gpt["max_tokens"] = 32768
+            elif "deepseek" in model_lower:
+                url = ''
+                api_key = ''
+            else:
+                url = "https://api.openai.com/v1/chat/completions"
+                api_key = str(os.getenv('OPENAI'))
 
-        if "o1" in model:
+        if "o1" in model_lower and use_official != "openrouter":
             if "temperature" in params_gpt:
                 del params_gpt["temperature"]
         
@@ -227,13 +264,17 @@ class OpenAIApiProxy():
                 if site_name:
                     extra_headers["X-Title"] = site_name
                 
+                openrouter_kwargs = dict(kwargs)
+                if "max_tokens" not in openrouter_kwargs and params_gpt.get("max_tokens") is not None:
+                    openrouter_kwargs["max_tokens"] = params_gpt["max_tokens"]
+
                 # Create completion
                 completion = client.chat.completions.create(
                     extra_headers=extra_headers,
                     model=model,  # e.g. "google/gemini-2.5-pro-preview"
                     messages=messages,
                     temperature=temperature if temperature is not None else 0.7,
-                    **kwargs
+                    **openrouter_kwargs
                 )
                 
                 # Format response to match expected output
@@ -254,7 +295,7 @@ class OpenAIApiProxy():
                 raise
                 
         # Handle Gemini API
-        if "gemini" in model:
+        if use_official == "gemini" or "gemini" in model_lower:
             try:
                 # Process messages for Gemini format
                 gemini_messages = []
